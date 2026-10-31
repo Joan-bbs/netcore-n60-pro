@@ -16,6 +16,14 @@ on:
   repository_dispatch:
   workflow_dispatch:
 
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-6.6
   REPO_BRANCH: openwrt-24.10-6.6
@@ -28,6 +36,7 @@ env:
   UPLOAD_RELEASE: true
   FIRMWARE_TAG: padavanonly-237-mt798x-6.6
   TZ: Asia/Shanghai
+  CCACHE_MAXSIZE: 2G
 
 jobs:
   build:
@@ -85,39 +94,71 @@ jobs:
         ! grep -Eq 'PACKAGE_\$\(PKG_NAME\)_dae|\.\./dae/files/dae\.config' package/community/openwrt-daede/luci-app-daede/Makefile
         ./scripts/feeds update -i packages luci smpackage
 
-    - name: Update feeds
-      run: cd openwrt && ./scripts/feeds update -a
-
     - name: Install feeds
       run: cd openwrt && ./scripts/feeds install -a
 
     - name: Load custom configuration
       run: |
         [ -e files ] && mv files openwrt/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        test -s "$CONFIG_FILE"
+        cp "$CONFIG_FILE" openwrt/.config
         chmod +x $DIY_P2_SH
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: Restore compiler cache
+      uses: actions/cache@v4
+      continue-on-error: true
+      with:
+        path: /workdir/openwrt/.ccache
+        key: ${{ runner.os }}-ubuntu22-mt798x66-ccache-v1-${{ hashFiles('padavanonly-immortalwrt-mt798x-6.6.config', 'diy-part1.sh', 'diy-part5-6.6.sh') }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          ${{ runner.os }}-ubuntu22-mt798x66-ccache-v1-${{ hashFiles('padavanonly-immortalwrt-mt798x-6.6.config', 'diy-part1.sh', 'diy-part5-6.6.sh') }}-
 
     - name: Download package
       id: package
       run: |
         cd openwrt
         make defconfig
+        mkdir -p "$GITHUB_WORKSPACE/build-records"
+        cp .config "$GITHUB_WORKSPACE/build-records/final.config"
         grep -qx 'CONFIG_CCACHE=y' .config || {
           echo "::error title=Compiler cache disabled::CONFIG_CCACHE was dropped by make defconfig"
           exit 1
         }
-        make download -j8
-        find dl -size -1024c -exec ls -l {} \;
-        find dl -size -1024c -exec rm -f {} \;
+        # Validate requested removals without changing the generated config.
+        if grep -Eq '^CONFIG_PACKAGE_(luci-app-openclash|luci-app-quickstart|quickstart)=[ym]$' .config; then
+          echo "::error::A removed package was re-enabled by dependency resolution"
+          exit 1
+        fi
+        grep -qx 'CONFIG_PACKAGE_daed=y' .config
+        grep -qx 'CONFIG_PACKAGE_luci-app-daede=y' .config
+        ./scripts/diffconfig.sh > "$GITHUB_WORKSPACE/build-records/diffconfig.txt"
+        {
+          printf 'Workflow commit: %s\n' "$GITHUB_SHA"
+          printf 'Firmware source: %s %s\n' "$REPO_URL" "$REPO_BRANCH"
+          git rev-parse HEAD
+          for source_dir in feeds/* package/community/openwrt-daede feeds/packages/lang/golang; do
+            if [ -d "$source_dir/.git" ] || [ -f "$source_dir/.git" ]; then
+              printf '\n%s\n' "$source_dir"
+              git -C "$source_dir" rev-parse HEAD
+            fi
+          done
+        } > "$GITHUB_WORKSPACE/build-records/source-revisions.txt"
+        cp feeds.conf.default "$GITHUB_WORKSPACE/build-records/feeds.conf.default"
+        set -o pipefail
+        make download -j8 2>&1 | tee "$GITHUB_WORKSPACE/build-records/download.log" || \
+          make download -j1 V=s 2>&1 | tee -a "$GITHUB_WORKSPACE/build-records/download.log"
 
     - name: Compile the firmware
       id: compile
       run: |
         cd openwrt
         echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j1 || make -j1 V=s
+        mkdir -p "$GITHUB_WORKSPACE/build-records"
+        set -o pipefail
+        make -j"$(nproc)" 2>&1 | tee "$GITHUB_WORKSPACE/build-records/compile.log" || \
+          make -j1 V=s 2>&1 | tee -a "$GITHUB_WORKSPACE/build-records/compile.log"
         echo "status=success" >> $GITHUB_OUTPUT
         grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
         [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
@@ -136,48 +177,77 @@ jobs:
 
     - name: Organize files
       id: organize
-      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      if: success() && steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true'
       run: |
-        cd openwrt/bin/targets/*/*
+        shopt -s nullglob
+        target_dirs=(openwrt/bin/targets/*/*)
+        if [ "${#target_dirs[@]}" -ne 1 ]; then
+          echo "::error::Expected exactly one firmware target directory"
+          exit 1
+        fi
+        cd "${target_dirs[0]}"
         rm -rf packages
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-        echo "status=success" >> $GITHUB_OUTPUT
+        images=(*.bin *.itb *.img *.img.gz *.img.zst)
+        if [ "${#images[@]}" -eq 0 ]; then
+          echo "::error::No firmware image was produced"
+          exit 1
+        fi
+        cp -f ./*.manifest "$GITHUB_WORKSPACE/build-records/" 2>/dev/null || true
+        echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
+        echo "status=success" >> "$GITHUB_OUTPUT"
 
     - name: Upload firmware directory
       uses: actions/upload-artifact@main
-      if: steps.organize.outputs.status == 'success' && !cancelled()
+      if: success() && steps.compile.outputs.status == 'success' && steps.organize.outputs.status == 'success'
       with:
         name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}
 
     - name: Generate release tag
       id: tag
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      if: success() && env.UPLOAD_RELEASE == 'true' && steps.organize.outputs.status == 'success'
       run: |
-        echo "release_tag=$(date +"%Y.%m.%d-%H%M")-${{ env.FIRMWARE_TAG }}" >> $GITHUB_OUTPUT
-        touch release.txt
-        [ ${UPLOAD_GOFILE} = true && ${{ steps.gofile.outputs.url }} ] && echo "🔗 [GoFile](${{ steps.gofile.outputs.url }})" >> release.txt
-        echo "status=success" >> $GITHUB_OUTPUT
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")-${FIRMWARE_TAG}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+        {
+          printf 'Firmware built from workflow commit `%s`.\n\n' "$GITHUB_SHA"
+          printf 'Build logs, final configuration and source revisions are in the Actions build-records artifact.\n'
+        } > release.txt
+        echo "status=success" >> "$GITHUB_OUTPUT"
 
     - name: Upload firmware to release
+      id: release
       uses: softprops/action-gh-release@master
-      if: steps.tag.outputs.status == 'success' && !cancelled()
+      if: success() && steps.compile.outputs.status == 'success' && steps.organize.outputs.status == 'success' && steps.tag.outputs.status == 'success'
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         tag_name: ${{ steps.tag.outputs.release_tag }}
         body_path: release.txt
+        fail_on_unmatched_files: true
         files: ${{ env.FIRMWARE }}/*
 
+    - name: Upload build records
+      if: always()
+      uses: actions/upload-artifact@v4
+      continue-on-error: true
+      with:
+        name: build-records-${{ github.run_id }}-${{ github.run_attempt }}
+        path: build-records/
+        if-no-files-found: ignore
+        retention-days: 30
+
     - name: Delete workflow runs
+      if: success() && steps.compile.outputs.status == 'success'
+      continue-on-error: true
       uses: Mattraks/delete-workflow-runs@main
       with:
-        retain_days: 0
-        keep_minimum_runs: 2
+        retain_days: 30
+        keep_minimum_runs: 10
 
     - name: Remove old Releases
+      continue-on-error: true
       uses: dev-drprasad/delete-older-releases@master
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      if: success() && steps.release.outcome == 'success'
       with:
         keep_latest: 6
         delete_tags: true
