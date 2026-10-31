@@ -58,3 +58,30 @@ fi
 #         option proto 'udp'
 #         option target 'ACCEPT'
 # EOF
+
+# Remove only the LuCI Channel Analysis menu and view.
+# Keep luci-mod-status, Wi-Fi scanning, iw/iwinfo and wireless drivers.
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+status = Path("feeds/luci/modules/luci-mod-status")
+menu = status / "root/usr/share/luci/menu.d/luci-mod-status.json"
+view = status / "htdocs/luci-static/resources/view/status/channel_analysis.js"
+
+if not menu.is_file():
+    raise SystemExit("Cannot locate luci-mod-status menu; review source layout before building.")
+data = json.loads(menu.read_text(encoding="utf-8"))
+key = "admin/status/channel_analysis"
+if key in data:
+    entry = data[key]
+    if entry.get("action", {}).get("path") != "status/channel_analysis":
+        raise SystemExit("Channel Analysis menu changed upstream; refusing an ambiguous edit.")
+    del data[key]
+    menu.write_text(json.dumps(data, ensure_ascii=False, indent="\t") + "\n", encoding="utf-8")
+if view.exists():
+    view.unlink()
+assert key not in json.loads(menu.read_text(encoding="utf-8"))
+assert not view.exists()
+print("Removed Channel Analysis menu and view; other status pages preserved.")
+PY
